@@ -8,10 +8,10 @@
 #define CLOCK_PROCESS_CPUTIME_ID ((clockid_t) 2)
 #endif
 
-#define NUM_HWR 4
+#define NUM_HWR 8
 #define NUM_Q   (NUM_HWR * 1)
-#define BATCH   (NUM_HWR * 10)  // Max NUM_HWR * 10
-#define FIX_K   0
+#define BATCH   (NUM_HWR * 6)  // Max NUM_HWR * 10
+#define FIX_K   1
 #define VERBOSE 0
 
 int main() {
@@ -29,11 +29,13 @@ int main() {
     // (Optional) use constant k value
 #if (FIX_K)
     pka_operand_t *fixedK = ecdsa_make_operand(ecdsa, P256_k, 32);
-    ecdsa_print_operand("k(fix)", fixedK);
+#if (VERBOSE)
     pka_operand_t *gldR = ecdsa_make_operand(ecdsa, P256_r, 32);
     pka_operand_t *gldS = ecdsa_make_operand(ecdsa, P256_s, 32);
+    ecdsa_print_operand("k(fix)", fixedK);
     ecdsa_print_operand("R(gld)", gldR);
     ecdsa_print_operand("S(gld)", gldS);
+#endif
 #endif
 
     // Initialize the worker and submit hash
@@ -56,7 +58,7 @@ int main() {
     // Fetch the results
     int gotRes = 0;
     while (gotRes < BATCH) {
-        uint32_t nres = ecdsa_get_signatures(wrkr, signs, BATCH);
+        uint32_t nres = ecdsa_get_signatures(wrkr, signs, BATCH, 0);
 #if (VERBOSE)
         if (nres != 0) printf("\nGot %u results\n", nres);
         for (int i = 0; i < nres; i++) {
@@ -84,8 +86,10 @@ int main() {
     ecdsa_operand_free(hash);
 #if (FIX_K)
     ecdsa_operand_free(fixedK);
+#if (VERBOSE)
     ecdsa_operand_free(gldR);
     ecdsa_operand_free(gldS);
+#endif
 #endif
     ecdsa_free(ecdsa);
     printf("Done.\n");

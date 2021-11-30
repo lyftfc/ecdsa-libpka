@@ -7,6 +7,13 @@
 #define CMD_Q_SIZE  (32 << 14)
 #define RSLT_Q_SIZE (32 << 12)
 
+#define MAX_STREAM_CAP_HWR  6   // Maximum stream capacity per ring
+
+#define PREGEN_K_ADDR_BITS  12  // 2^12 = 4kB
+#define PREGEN_K_ADDR_BYTES ((PREGEN_K_ADDR_BITS + 7) >> 3)
+#define PREGEN_K_SIZE       (1 << PREGEN_K_ADDR_BITS)
+#define PREGEN_K_MASK       (PREGEN_K_SIZE - 1)
+
 /* Functions adapted from Mellanox's PKA library testing code */
 
 static void fill_operand(pka_operand_t *operand, const uint8_t *buf_ptr,
@@ -285,19 +292,20 @@ void ecdsa_operand_free(pka_operand_t *oprd)
 ecdsa_ret_t ecdsa_sign_hash(ecdsa_worker_t *worker,
     pka_operand_t *hash, pka_operand_t *rand)
 {
-    // static uint32_t k_cnt = 0;
-    pka_operand_t *k = ecdsa_make_operand(worker->inst, NULL, 0);
-    // printf("Alloc k %u:%p\n", k_cnt++, k);
+    pka_operand_t *k;
+    void *usr_ptr = NULL;
     pka_handle_t curr_hdl = worker->handles[worker->next_enq];
     if (rand != NULL) {
-        fill_operand(k, rand->buf_ptr, rand->actual_len, rand->big_endian);
+        k = rand;   // Do not allocate if k is given
     } else {
-        // We generate one less byte of k so that it will be smaller than n
+        // We generate one less byte of k to ensure k < n
+        k = ecdsa_make_operand(worker->inst, NULL, 0);
         pka_get_rand_bytes(curr_hdl,
             k->buf_ptr, worker->inst->opr_width - 1);
         k->actual_len = worker->inst->opr_width - 1;
+        usr_ptr = k;    // Keep track of k so we can free it later
     }
-    int rc = pka_ecdsa_signature_generate(curr_hdl, k,
+    int rc = pka_ecdsa_signature_generate(curr_hdl, usr_ptr,
         worker->inst->curve,
         worker->inst->base, worker->inst->order,
         worker->inst->priv_key, hash, k);
@@ -313,25 +321,30 @@ ecdsa_ret_t ecdsa_sign_hash(ecdsa_worker_t *worker,
 
 // Read at most maxNumSigns signatures into signs, returns actual number
 // of results that are read. R and S are empty if that signing failed.
+// If isSignsInited is set to non-zero, it tries to use buffers of signs.
 uint32_t ecdsa_get_signatures(ecdsa_worker_t *worker,
-    dsa_signature_t *signs, uint32_t maxNumSigns)
+    dsa_signature_t *signs, uint32_t maxNumSigns, uint8_t isSignsInited)
 {
-    // static uint32_t k_cnt = 0;
     uint32_t count;
     for (count = 0; count < maxNumSigns; count++) {
         pka_handle_t hdl = worker->handles[worker->next_deq];
         if (!pka_has_avail_result(hdl)) break;
         pka_results_t res;
-        for (int i = 0; i < 2; i++) {
-            pka_operand_t *ptmp = ecdsa_make_operand(worker->inst, NULL, 0);
-            res.results[i] = *ptmp;
-            free(ptmp); // Only free the operand but not its buffer
+        if (isSignsInited) {
+            res.results[0] = signs[count].r;
+            res.results[1] = signs[count].s;
+        } else {
+            for (int i = 0; i < 2; i++) {
+                pka_operand_t *ptmp = ecdsa_make_operand(worker->inst, NULL, 0);
+                res.results[i] = *ptmp;
+                free(ptmp); // Only free the operand but not its buffer
+            }
         }
         pka_get_result(hdl, &res);
         signs[count].r = res.results[0];    // Allocated operand buffers goes here
         signs[count].s = res.results[1];
-        // printf("Free k %u:%p\n", k_cnt++, res.user_data);
-        ecdsa_operand_free(res.user_data);  // Free the generated k previously passed in
+        if (res.user_data != NULL)  // Free the generated k if previously allocated
+            ecdsa_operand_free(res.user_data);  
         if (res.opcode != CC_ECDSA_GENERATE || res.status != RC_NO_ERROR) {
             // We got problem here so we mark this result invalid
             signs[count].r.actual_len = 0;
@@ -372,4 +385,113 @@ void ecdsa_print_operand(const char *info, pka_operand_t *oprd)
             printf("%02X ", oprd->buf_ptr[i]);
     }
     printf("\n");
+}
+
+/* ECDSA Streaming Interface, as a wrapper of worker */
+
+// Initialize an ECDSA stream using a given worker & its instance
+ecdsa_stream_t *ecdsa_stream_init(ecdsa_worker_t *worker,
+    uint32_t capacity, uint8_t pregen_k)
+{
+    // Check requested capacity first
+    uint32_t maxcap = pka_get_rings_count(worker->inst->pka_inst) * MAX_STREAM_CAP_HWR;
+    if(capacity > maxcap) return NULL;
+    pka_handle_t hdlRep = worker->handles[worker->next_enq];
+    // Construct the streaming instance
+    ecdsa_stream_t *str = malloc(sizeof(ecdsa_stream_t));
+    uint32_t width = worker->inst->opr_width;
+    str->worker = worker;
+    str->capacity = capacity;
+    str->pending = 0;
+    str->next_in = 0;
+    str->is_pregen_k = pregen_k;
+    str->k_arr = malloc(sizeof(pka_operand_t) * capacity);
+    str->hash_arr = malloc(sizeof(pka_operand_t) * capacity);
+    str->res_arr = malloc(sizeof(dsa_signature_t) * capacity);
+    str->hash_pool = malloc(width * capacity);
+    str->res_pool = malloc(width * capacity * 2);
+    if (pregen_k) {
+        uint32_t kSize = PREGEN_K_SIZE + width;
+        str->k_pool = malloc(kSize);
+        pka_get_rand_bytes(hdlRep, str->k_pool, kSize);
+    } else {
+        str->k_pool = malloc(width * capacity);
+        memset(str->k_pool, 0, width * capacity);
+    }
+    for (uint32_t i = 0; i < capacity; i++) {
+        str->k_arr[i].buf_len = width;
+        str->k_arr[i].actual_len = width - 1;   // Fill 1 less byte for k
+        str->k_arr[i].is_encrypted = 0;
+        str->k_arr[i].big_endian = pka_get_rings_byte_order(hdlRep);
+        str->k_arr[i].internal_use = 0;
+        str->k_arr[i].pad = 0;
+        str->k_arr[i].buf_ptr = pregen_k ? NULL : (str->k_pool + width * i);
+        init_operand(&str->hash_arr[i], (str->hash_pool + width * i), width);
+        init_operand(&str->res_arr[i].r, (str->res_pool + 2 * width * i), width);
+        init_operand(&str->res_arr[i].s, (str->res_pool + 2 * width * i + width), width);
+    }
+    return str;
+}
+
+// Free a ECDSA streaming instance, does NOT free the underlying worker
+void ecdsa_stream_free(ecdsa_stream_t *stream)
+{
+    free(stream->k_arr);
+    free(stream->hash_arr);
+    free(stream->res_arr);
+    free(stream->k_pool);
+    free(stream->hash_pool);
+    free(stream->res_pool);
+    free(stream);
+}
+
+// Enqueue a hash value to the signing stream, fails if stream is full
+ecdsa_ret_t ecdsa_stream_enqueue(ecdsa_stream_t *stream, pka_operand_t *hash)
+{
+    if (stream->pending >= stream->capacity) return ECDSA_FAIL;
+    ecdsa_worker_t *worker = stream->worker;
+    pka_operand_t *h = &stream->hash_arr[stream->next_in];
+    fill_operand(h, hash->buf_ptr, hash->actual_len, hash->big_endian);
+    pka_operand_t *k = &stream->k_arr[stream->next_in];
+    if (stream->is_pregen_k) {  // We draw a place in the pre-generated table
+        // PREGEN_K_ADDR_BITS should be less than 32 (and it surely will)
+        uint32_t idx;
+        // IMPORTANT: Assuming that we are on little-endian CPU (Aarch64 is)
+        pka_get_rand_bytes(worker->handles[worker->next_enq],
+            (uint8_t *)&idx, PREGEN_K_ADDR_BYTES);
+        idx &= PREGEN_K_MASK;
+        k->buf_ptr = stream->k_pool + idx;
+    } else {    // We generate a random k
+        pka_get_rand_bytes(worker->handles[worker->next_enq],
+            k->buf_ptr, k->actual_len);
+    }
+    ecdsa_ret_t rc = ecdsa_sign_hash(worker, h, k);
+    if (rc == ECDSA_SUCC) {
+        stream->pending++;
+        stream->next_in = (stream->next_in == stream->capacity - 1) ?
+            0 : stream->next_in + 1;
+    }
+    return rc;
+}
+
+// Dequeue available signatures to the result buffer, return number of results
+uint32_t ecdsa_stream_dequeue(ecdsa_stream_t *stream, dsa_signature_t **res)
+{
+    uint32_t nres = ecdsa_get_signatures(
+        stream->worker, stream->res_arr, stream->capacity, 1);
+    stream->pending -= nres;
+    *res = stream->res_arr;
+    return nres;
+}
+
+// Enqueue a hash value and dequeue available results, returns the enqueue result
+ecdsa_ret_t ecdsa_stream_enqdeq(ecdsa_stream_t *stream,
+    pka_operand_t *hash, dsa_signature_t **res, uint32_t *n_res)
+{
+    // We do dequeue first to try to give space
+    *n_res = ecdsa_stream_dequeue(stream, res);
+    // Then we enqueue if there is a hash (i.e. not null)
+    if (hash != NULL)
+        return ecdsa_stream_enqueue(stream, hash);
+    else return ECDSA_FAIL;
 }

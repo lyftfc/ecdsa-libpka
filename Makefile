@@ -2,6 +2,9 @@ HDRS := ec_curves.h testvec.h ecdsa_utils.h
 CFLAGS := -I../lib -g
 LIB := /usr/lib/aarch64-linux-gnu/libPKA.so
 
+ecdsa_stream_bm: ecdsa_stream_bm.o ecdsa_utils.o
+	gcc -o $@ $^ $(LIB)
+
 ecdsa_benchmark: ecdsa_benchmark.o ecdsa_utils.o
 	gcc -o $@ $^ $(LIB)
 
