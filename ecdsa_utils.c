@@ -285,7 +285,9 @@ void ecdsa_operand_free(pka_operand_t *oprd)
 ecdsa_ret_t ecdsa_sign_hash(ecdsa_worker_t *worker,
     pka_operand_t *hash, pka_operand_t *rand)
 {
+    // static uint32_t k_cnt = 0;
     pka_operand_t *k = ecdsa_make_operand(worker->inst, NULL, 0);
+    // printf("Alloc k %u:%p\n", k_cnt++, k);
     pka_handle_t curr_hdl = worker->handles[worker->next_enq];
     if (rand != NULL) {
         fill_operand(k, rand->buf_ptr, rand->actual_len, rand->big_endian);
@@ -314,6 +316,7 @@ ecdsa_ret_t ecdsa_sign_hash(ecdsa_worker_t *worker,
 uint32_t ecdsa_get_signatures(ecdsa_worker_t *worker,
     dsa_signature_t *signs, uint32_t maxNumSigns)
 {
+    // static uint32_t k_cnt = 0;
     uint32_t count;
     for (count = 0; count < maxNumSigns; count++) {
         pka_handle_t hdl = worker->handles[worker->next_deq];
@@ -327,7 +330,8 @@ uint32_t ecdsa_get_signatures(ecdsa_worker_t *worker,
         pka_get_result(hdl, &res);
         signs[count].r = res.results[0];    // Allocated operand buffers goes here
         signs[count].s = res.results[1];
-        free(res.user_data);    // Free the generated k previously passed in
+        // printf("Free k %u:%p\n", k_cnt++, res.user_data);
+        ecdsa_operand_free(res.user_data);  // Free the generated k previously passed in
         if (res.opcode != CC_ECDSA_GENERATE || res.status != RC_NO_ERROR) {
             // We got problem here so we mark this result invalid
             signs[count].r.actual_len = 0;

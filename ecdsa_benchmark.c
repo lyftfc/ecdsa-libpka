@@ -8,11 +8,11 @@
 #define CLOCK_PROCESS_CPUTIME_ID ((clockid_t) 2)
 #endif
 
-#define BATCH   40  // Max NUM_HWR * 10
 #define NUM_HWR 4
-#define NUM_Q   4
+#define NUM_Q   (NUM_HWR * 1)
+#define BATCH   (NUM_HWR * 10)  // Max NUM_HWR * 10
 #define FIX_K   0
-#define PRN_RES 0
+#define VERBOSE 0
 
 int main() {
     // Initialize the instance
@@ -21,8 +21,10 @@ int main() {
     if (ecdsa == NULL) return -1;
     pka_operand_t *hash = ecdsa_make_operand(ecdsa, P256_hash, 32);
     ecdsa->priv_key = ecdsa_make_operand(ecdsa, P256_private_key, 32);
+#if (VERBOSE)
     ecdsa_print_operand("Digest", hash);
     ecdsa_print_operand("PrvKey", ecdsa->priv_key);
+#endif
 
     // (Optional) use constant k value
 #if (FIX_K)
@@ -55,7 +57,7 @@ int main() {
     int gotRes = 0;
     while (gotRes < BATCH) {
         uint32_t nres = ecdsa_get_signatures(wrkr, signs, BATCH);
-#if (PRN_RES)
+#if (VERBOSE)
         if (nres != 0) printf("\nGot %u results\n", nres);
         for (int i = 0; i < nres; i++) {
             ecdsa_print_operand("\nR", &signs[i].r);
