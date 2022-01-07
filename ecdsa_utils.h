@@ -55,6 +55,9 @@ ecdsa_worker_t *ecdsa_worker_init(ecdsa_inst_t *inst, uint32_t numHdls);
 // Free and clean up the worker and its underlying PKA handle(s)
 void ecdsa_worker_free(ecdsa_worker_t *worker);
 
+// Flush any pre-existing results in the hardware rings of the worker
+void ecdsa_worker_flush(ecdsa_worker_t *worker);
+
 // Prepare an ECDSA operand, optionally with big-endian data in src (or empty)
 pka_operand_t *ecdsa_make_operand(ecdsa_inst_t *inst,
     const uint8_t src[], uint32_t srcLen);

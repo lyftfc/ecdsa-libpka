@@ -7,7 +7,7 @@
 #define CMD_Q_SIZE  (32 << 14)
 #define RSLT_Q_SIZE (32 << 12)
 
-#define MAX_STREAM_CAP_HWR  6   // Maximum stream capacity per ring
+#define MAX_STREAM_CAP_HWR  10   // Maximum stream capacity per ring
 
 #define PREGEN_K_ADDR_BITS  12  // 2^12 = 4kB
 #define PREGEN_K_ADDR_BYTES ((PREGEN_K_ADDR_BITS + 7) >> 3)
@@ -268,6 +268,28 @@ void ecdsa_worker_free(ecdsa_worker_t *worker)
     free(worker);
 }
 
+// Flush any pre-existing results in the hardware rings of the worker
+void ecdsa_worker_flush(ecdsa_worker_t *worker)
+{
+    bool repeat;
+    pka_results_t tmp;
+    uint32_t buf_len = worker->inst->opr_width;
+    tmp.results[0].buf_ptr = malloc(buf_len);
+    tmp.results[0].buf_len = buf_len;
+    tmp.results[1].buf_ptr = malloc(buf_len);
+    tmp.results[1].buf_len = buf_len;
+    do {
+        repeat = false;
+        for (int i = 0; i < worker->num_hdls; i++) {
+            pka_handle_t hdl = worker->handles[i];
+            if (pka_has_avail_result(hdl)) {
+                pka_get_result(hdl, &tmp);
+                repeat = true;
+            }
+        }
+    } while (repeat);
+}
+
 // Prepare an ECDSA operand, optionally with big-endian data in src (or empty)
 pka_operand_t *ecdsa_make_operand(ecdsa_inst_t *inst,
     const uint8_t src[], uint32_t srcLen)
@@ -310,7 +332,8 @@ ecdsa_ret_t ecdsa_sign_hash(ecdsa_worker_t *worker,
         worker->inst->base, worker->inst->order,
         worker->inst->priv_key, hash, k);
     if (rc != 0) {  // We caught an error here
-        ecdsa_operand_free(k);
+        if (usr_ptr != NULL) ecdsa_operand_free(k);
+        printf("sign hash error: %d\n", rc);
         return ECDSA_FAIL;
     } else {
         worker->next_enq = (worker->next_enq == worker->num_hdls - 1) ?
@@ -340,11 +363,21 @@ uint32_t ecdsa_get_signatures(ecdsa_worker_t *worker,
                 free(ptmp); // Only free the operand but not its buffer
             }
         }
-        pka_get_result(hdl, &res);
+        if (pka_get_result(hdl, &res)) {
+            // pka_has_avail_result said we have something but actually not
+            // Clean up and breaking loop for this call
+            if (!isSignsInited) {
+                free(res.results[0].buf_ptr);
+                free(res.results[1].buf_ptr);
+            }
+            break;
+        }
         signs[count].r = res.results[0];    // Allocated operand buffers goes here
         signs[count].s = res.results[1];
-        if (res.user_data != NULL)  // Free the generated k if previously allocated
-            ecdsa_operand_free(res.user_data);  
+        // TODO: Got segfault here, disabling temporarily. Sometimes when user_data is
+        //  passed in NULL, still got non-NULL data out.
+        // if (res.user_data != NULL)  // Free the generated k if previously allocated
+        //     ecdsa_operand_free(res.user_data);
         if (res.opcode != CC_ECDSA_GENERATE || res.status != RC_NO_ERROR) {
             // We got problem here so we mark this result invalid
             signs[count].r.actual_len = 0;
@@ -479,6 +512,11 @@ uint32_t ecdsa_stream_dequeue(ecdsa_stream_t *stream, dsa_signature_t **res)
 {
     uint32_t nres = ecdsa_get_signatures(
         stream->worker, stream->res_arr, stream->capacity, 1);
+    // Workaround for rare case of more results than what we expect
+    if (stream->pending < nres) {   // Shouldn't hit here
+        printf("Err: more res than expected\n");
+        nres = stream->pending;
+    }
     stream->pending -= nres;
     *res = stream->res_arr;
     return nres;
